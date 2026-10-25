@@ -2,29 +2,27 @@
 
 ## Overview
 
-This repository contains a collection of Node.js Google Cloud Functions designed for the Connect-ED application. These functions scrape data from various sources (CISAA and GameSheetStats), process it, and store it in Firebase Firestore. The system handles sports data (schedules, results, standings, rosters), as well as lunch menus, articles, and events.
+This repository contains a collection of Node.js Google Cloud Functions designed for the Connect-ED application. These functions scrape sports data from the CISAA results page (http://www.cisaa.ca/cisaa/ShowPage.pb?CISAA_Results.html), process it, and store it in Firebase Firestore. The system handles sports data (schedules, results, standings), as well as lunch menus, articles, and events.
 
 ## Features
 
 - **Web Scraping**:
-    - Puppeteer for dynamic content rendering (e.g., GameSheetStats).
-    - Cheerio and Axios for parsing static HTML content (e.g., CISAA site).
+    - Cheerio and Axios for parsing the CISAA results page. Leagues are discovered from the page's Fall/Winter/Spring dropdowns and tables are recognised by their header rows, so new league codes need no code change.
+    - A run that finds no leagues or no games throws, so a future layout change shows up as a failed run instead of a silent no-op.
 - **Comprehensive Data Modeling**:
-    - JavaScript classes for `Sports`, `Standings`, `Games` (including `Goals`), `Rosters` (including `Players`), `LunchMenus`, `Articles`, and `Events`.
+    - JavaScript classes for `Standings`, `Games`, `LunchMenus`, `Articles`, and `Events`.
     - `toMap()` methods in models for easy Firestore serialization.
-    - Sport-specific subclasses for detailed player/goalie stats where applicable.
 - **Firestore Integration**:
     - Firebase Admin SDK for backend database operations.
     - `set...` functions for writing/updating data to various Firestore collections (e.g., `Sports`, `Games`, `Team Rosters`, `LunchMenus`, `Articles`, `Events`).
     - Standings are stored as an array within `Sports` documents.
-    - Game goals (for GameSheet games) are stored as an array within `Games` documents.
-    - Player rosters are stored as an array within `Team Rosters` documents.
+    - `Team Rosters` documents are read-only now: they came from GameSheet, which CISAA no longer embeds.
     - `get...` utility functions for retrieving data from Firestore.
 - **Automated and On-Demand Operations**:
     - Scheduled Cloud Functions for regular updates (e.g., daily game/standings updates, weekly full data refresh).
     - On-demand (HTTP and Callable) functions for immediate data fetching or updates.
 - **Modular Design**:
-    - Clear separation of concerns: scraping logic (`games.js`, `gamesheet.js`), database interactions (`database.js`), and data models (`models/`).
+    - Clear separation of concerns: scraping logic (`cisaa.js`, `games.js`), database interactions (`database.js`), and data models (`models/`).
 - **Environment-Aware Configuration**:
     - Supports local Firebase service account keys via environment variables for development and testing.
 
@@ -35,7 +33,6 @@ This repository contains a collection of Node.js Google Cloud Functions designed
     - Cloud Functions (v2)
     - Firestore
     - Firebase Admin SDK
-- **Puppeteer**
 - **Axios**
 - **Cheerio**
 - **qs**
@@ -48,22 +45,20 @@ connect-ed-2-cloud-functions/
 ├── functions/                      # ← your Cloud Functions codebase
 │   ├── index.js                    # Entry point: exports Firebase Functions (scheduled & on-demand)
 │   ├── src/                        
-│   │   ├── games.js                # Scraping logic for CISAA site
-│   │   ├── gamesheet.js            # Scraping logic for GameSheetStats
+│   │   ├── cisaa.js                # Fetches and parses the CISAA results page (pure parsers)
+│   │   ├── games.js                # Turns parsed pages into Sports/Games documents
 │   │   ├── database.js             # Firestore initialization, set/get functions for all data types
 │   │   └── models/
 │   │       ├── Article.js          # Article class
 │   │       ├── Event.js            # Event class
-│   │       ├── GameClasses.js      # BaseGame, gamesheetGame (includes goals array)
-│   │       ├── goal.js             # Goal class (used within gamesheetGame model)
+│   │       ├── GameClasses.js      # BaseGame
 │   │       ├── LunchMenu.js        # LunchMenuItem, LunchMenuStation, LunchMenu
-│   │       ├── RosterClasses.js    # BaseRoster, sport-specific player classes
 │   │       ├── schools.js          # Schools (static data)
-│   │       ├── sports.js           # Sports (static data)
-│   │       └── StandingsClasses.js # BaseStandings, sport-specific standings classes
+│   │       └── StandingsClasses.js # BaseStandings
 │   │       
+│   ├── scripts/dry-run.js          # Scrapes the live site and prints what would be written
+│   ├── test/                       # Unit tests and saved CISAA pages (test/fixtures)
 │   ├── .eslintrc.cjs               # ESLint config for functions
-│   ├── .puppeteerrc.cjs            # Puppeteer config
 │   ├── .gitignore                  # ignores node_modules, secrets, etc.
 │   ├── package.json                # Project dependencies and scripts
 │   └── node_modules/               # (functions-only dependencies)
@@ -93,7 +88,6 @@ connect-ed-2-cloud-functions/
     ```bash
     npm install
     ```
-    This will also run `puppeteer browsers install chrome` due to the `postinstall` script in `package.json`.
 
 4.  **Firebase Service Account for Local Development**:
     *   Go to your Firebase project settings in the Firebase Console -> "Service accounts".
@@ -117,51 +111,43 @@ connect-ed-2-cloud-functions/
     *   Initializes Firebase Admin SDK via `database.js`.
     *   Exports scheduled Cloud Functions (`onSchedule`) for:
         *   `scheduledUpdateGamesStandings`: Daily updates for games and standings.
-        *   `scheduledSetAll`: Weekly updates for all data (sports, standings, games, rosters).
+        *   `scheduledSetAll`: Weekly updates for all data (sports, standings, games).
         *   `scheduledSetSports`: Monthly updates for sports data.
     *   Exports numerous on-demand Cloud Functions (`onCall`, `onRequest`) for:
-        *   Setting and getting sports, standings, games, and rosters.
+        *   Setting and getting sports, standings and games, and getting stored rosters.
         *   Setting and getting lunch menus.
         *   Setting and getting articles.
         *   Setting and getting events.
         *   Triggering `updateGamesStandings` and `setAll` on demand.
 
-*   **`games.js`**:
-    *   `parseSports()`: Scrapes sports and league codes from CISAA.
-    *   `parseStandings()`: Scrapes team standings from CISAA (for non-GameSheet leagues).
-    *   `parseGames()`: Scrapes game schedules/results from CISAA (for non-GameSheet leagues).
-    *   Uses Axios and Cheerio for scraping.
+*   **`cisaa.js`**:
+    *   `CISAA_RESULTS_URL`: the one URL every request goes to (POST `txtleague=<code>`).
+    *   `parseLeagueList(html)`: Reads term, code and name from the `lstFall`/`lstWinter`/`lstSpring` dropdowns.
+    *   `parseResultsPage(html)`: Finds the standings and schedule tables by their header rows and returns `{standings, games}`. Dates on the page have no year; July–December are taken as the school year's first year and January–June as the second.
 
-*   **`gamesheet.js`**:
-    *   Handles scraping from `gamesheetstats.com` using Puppeteer.
-    *   `parseGameIDs()`: Retrieves game IDs.
-    *   `parseGameSheetGames()`: Fetches detailed game info, including goals.
-    *   `parseGameSheetSoccerStandings()`, `parseGameSheetHockeyStandings()`: Scrapes standings.
-    *   `parseGameSheetSoccerRoster()`, `parseGameSheetHockeyRoster()`: Scrapes rosters and player stats.
+*   **`games.js`**:
+    *   `parseSports()`: Lists every CISAA league and keeps the ones Appleby College plays in.
+    *   `parseStandings()`, `parseGames()`, `inSport()`: Built on `parseResultsPage`.
+    *   Uses Axios and Cheerio for scraping.
 
 *   **`database.js`**:
     *   `initializeFirebase()`: Initializes Firebase Admin SDK. Supports local service account key via `LOCAL_SA_PATH` env var or default credentials in the cloud.
     *   `setSports()`: Writes sports data to the `Sports` collection.
     *   `setStandings()`: Updates `Sports` documents with an array of standings data.
-    *   `setGames()`: Writes game data to the `Games` collection. For GameSheet games, goals are stored as an array within the game document.
-    *   `setRoster()`: Writes roster data to the `Team Rosters` collection, with players stored as an array within each team roster document.
+    *   `setGames()`: Writes game data to the `Games` collection. 
     *   `setLunchMenu()`, `setArticle()`, `setEvent()`: Write data to `LunchMenus`, `Articles`, and `Events` collections respectively.
     *   Various `get...` and `getAll...` functions to retrieve data from Firestore for all managed entities.
-    *   `setAll()`: Orchestrates scraping and setting all sports, standings, games, and rosters.
-    *   `updateGamesStandings()`: Updates games and standings, managing a shared Puppeteer instance for efficiency.
-    *   `getSeason()`: Determines the current sports season.
+    *   `setAll()`: Orchestrates scraping and setting all sports, standings and games. Throws if no games are found.
+    *   `updateGamesStandings()`: Updates games and standings for this school year's leagues in the current season. Throws if no games are found.
 
 *   **`models/`**:
     *   Contains JavaScript classes for data entities, each with a `constructor` and `toMap()` method.
     *   `Article.js`: Class for articles.
     *   `Event.js`: Class for events.
-    *   `GameClasses.js`: `BaseGame` and `gamesheetGame` (includes a `goals` array).
-    *   `goal.js`: `Goal` class, instances are stored within the `gamesheetGame`'s `goals` array.
+    *   `GameClasses.js`: `BaseGame`.
     *   `LunchMenu.js`: `LunchMenuItem`, `LunchMenuStation`, `LunchMenu` classes.
-    *   `RosterClasses.js`: `BaseRoster` and sport-specific player/goalie classes.
     *   `schools.js`: Static school data and lookup methods.
-    *   `sports.js`: Static sports data and lookup methods.
-    *   `StandingsClasses.js`: `BaseStandings` and sport-specific standings classes.
+    *   `StandingsClasses.js`: `BaseStandings`.
 
 ## Available Scripts (from `package.json`)
 
@@ -171,7 +157,8 @@ connect-ed-2-cloud-functions/
 *   `npm run start`: Runs the functions using Google Cloud Functions Framework (useful for local testing without full emulator).
 *   `npm run deploy`: Deploys functions to Firebase.
 *   `npm run logs`: Fetches logs for deployed functions.
-*   `npm run gcp-build`: A script typically used in Google Cloud Build environments to ensure Puppeteer's browser is correctly installed.
+*   `npm test`: Runs the unit tests against the saved CISAA pages in `test/fixtures`.
+*   `npm run dry-run`: Scrapes the live CISAA site and prints this season's Appleby games without writing to Firestore (`-- --all` for every term, `-- --json` for the documents).
 
 ## Deployment
 

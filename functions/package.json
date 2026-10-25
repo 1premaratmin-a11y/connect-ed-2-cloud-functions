@@ -8,8 +8,8 @@
     "start": "functions-framework --source=/index.js",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log",
-    "postinstall": "puppeteer browsers install chrome",
-    "gcp-build": "node node_modules/puppeteer/install.mjs"
+    "test": "node --test \"test/**/*.test.js\"",
+    "dry-run": "node scripts/dry-run.js"
   },
   "engines": {
     "node": "22"
@@ -21,8 +21,7 @@
     "cheerio": "^1.0.0",
     "firebase-admin": "^12.6.0",
     "firebase-functions": "^6.0.1",
-    "qs": "^6.14.0",
-    "puppeteer": "^24.4.0"
+    "qs": "^6.14.0"
   },
   "devDependencies": {
     "eslint": "^8.15.0",

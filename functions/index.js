@@ -2,14 +2,12 @@ const {
   setSports,
   setStandings,
   setGames,
-  setRoster,
   setAll,
   getSports,
   getStandings,
   getAllStandings,
   getGames,
   getAllGames,
-  getApplebyTeamCode,
   getRoster,
   setLunchMenu,
   getLunchMenuByDate,
@@ -43,6 +41,7 @@ exports.scheduledUpdateGamesStandings = onSchedule({
     logger.info("Scheduled updateGamesStandings completed successfully");
   } catch (error) {
     logger.error("Error in scheduledUpdateGamesStandings:", error);
+    throw error;
   }
 });
 
@@ -50,7 +49,7 @@ exports.scheduledUpdateGamesStandings = onSchedule({
 exports.scheduledSetAll = onSchedule({
   schedule: "every sunday 01:00",
   timeoutSeconds: 540,
-  memory: "4GiB",
+  memory: "1GiB",
   cpu: 2,
 }, async (event) => {
   logger.info("Scheduled setAll started", {event});
@@ -59,6 +58,7 @@ exports.scheduledSetAll = onSchedule({
     logger.info("Scheduled setAll completed successfully");
   } catch (error) {
     logger.error("Error in scheduled setAll:", error);
+    throw error;
   }
 });
 
@@ -75,6 +75,7 @@ exports.scheduledSetSports = onSchedule({
     logger.info("Scheduled setSports completed successfully");
   } catch (error) {
     logger.error("Error in scheduled setSports:", error);
+    throw error;
   }
 });
 
@@ -101,12 +102,12 @@ exports.onDemandSetStandings = onCall({
   memory: "1GiB",
 }, async (request) => {
   logger.info("onDemandSetStandings started", {request});
-  const {leagueCode, usesGamesheet} = request.data;
+  const {leagueCode} = request.data;
   if (!leagueCode) {
     throw new HttpsError("invalid-argument", "The function must be called with one argument \"leagueCode\".");
   }
   try {
-    await setStandings(leagueCode, usesGamesheet);
+    await setStandings(leagueCode);
     logger.info("onDemandSetStandings completed successfully");
     return {message: `Standings for league ${leagueCode} set successfully.`};
   } catch (error) {
@@ -120,12 +121,12 @@ exports.onDemandSetGames = onCall({
   memory: "1GiB",
 }, async (request) => {
   logger.info("onDemandSetGames started", {request});
-  const {leagueCode, usesGamesheet} = request.data;
+  const {leagueCode} = request.data;
   if (!leagueCode) {
     throw new HttpsError("invalid-argument", "The function must be called with one argument \"leagueCode\".");
   }
   try {
-    await setGames(leagueCode, usesGamesheet);
+    await setGames(leagueCode);
     logger.info("onDemandSetGames completed successfully");
     return {message: `Games for league ${leagueCode} set successfully.`};
   } catch (error) {
@@ -134,28 +135,9 @@ exports.onDemandSetGames = onCall({
   }
 });
 
-exports.onDemandSetRoster = onCall({
-  timeoutSeconds: 540,
-  memory: "1GiB",
-}, async (request) => {
-  logger.info("onDemandSetRoster started", {request});
-  const {leagueCode, usesGamesheet} = request.data;
-  if (!leagueCode) {
-    throw new HttpsError("invalid-argument", "The function must be called with one argument \"leagueCode\".");
-  }
-  try {
-    await setRoster(leagueCode, usesGamesheet);
-    logger.info("onDemandSetRoster completed successfully");
-    return {message: `Roster for league ${leagueCode} set successfully.`};
-  } catch (error) {
-    logger.error("Error in onDemandSetRoster:", error);
-    throw new HttpsError("internal", error.message, error);
-  }
-});
-
 exports.onDemandSetAll = onRequest({
   timeoutSeconds: 540,
-  memory: "4GiB",
+  memory: "1GiB",
   cpu: 2,
 }, async (request, response) => {
   logger.info("onDemandSetAll (onRequest) started", {method: request.method});
@@ -234,22 +216,6 @@ exports.onDemandGetAllGames = onRequest(async (request, response) => {
   } catch (error) {
     logger.error("Error in onDemandGetAllGames (onRequest):", error);
     response.status(500).send({error: "Internal server error", details: error.message});
-  }
-});
-
-exports.onDemandGetApplebyTeamCode = onCall(async (request) => {
-  logger.info("onDemandGetApplebyTeamCode started", {request});
-  const {leagueNum} = request.data;
-  if (!leagueNum) {
-    throw new HttpsError("invalid-argument", "The function must be called with one argument \"leagueNum\".");
-  }
-  try {
-    const teamCode = await getApplebyTeamCode(leagueNum);
-    logger.info("onDemandGetApplebyTeamCode completed successfully");
-    return {teamCode};
-  } catch (error) {
-    logger.error("Error in onDemandGetApplebyTeamCode:", error);
-    throw new HttpsError("internal", error.message, error);
   }
 });
 

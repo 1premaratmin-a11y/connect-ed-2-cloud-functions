@@ -1,8 +1,7 @@
-const puppeteer = require("puppeteer");
 const {initializeApp, cert} = require("firebase-admin/app");
 const {getFirestore} = require("firebase-admin/firestore");
-const {parseSports, parseStandings, parseGames, parseRoster} = require("./games.js");
-const {Sports} = require("./models/sports.js");
+const {parseSports, scrapeLeague, toStandings, toGames, mapLimit, FETCH_CONCURRENCY} = require("./games.js");
+const {schoolYearStart, getSeason} = require("./cisaa.js");
 const path = require("path");
 const fs = require("fs");
 const {Article} = require("./models/Article.js");
@@ -40,247 +39,144 @@ function initializeFirebase() {
 }
 
 /**
+ * Converts a "Sports" document (or a parseSports entry) to the league shape the scraper uses.
+ * @param {object} sport - A Sports document ({name, term, league_code}) or {name, term, leagueCode}.
+ * @return {{name: string, term: string, leagueCode: string}} The league.
+ */
+function toLeague(sport) {
+  return {name: sport.name, term: sport.term, leagueCode: sport.leagueCode || sport.league_code};
+}
+
+/**
  * setSports:
- * Scrapes sports data (using parseSports) and writes each record into the "Sports" collection.
+ * Finds Appleby's leagues on the CISAA results page (using parseSports) and writes each into the "Sports" collection,
+ * keyed by league code. Each document is stamped with the school year so last year's documents can be told apart.
  * @async
  * @function setSports
- * @throws {Error} If there's an error during parsing or committing to Firestore.
+ * @return {Promise<Array<{name: string, term: string, leagueCode: string}>>} The leagues written.
+ * @throws {Error} If scraping finds no leagues or committing to Firestore fails.
  */
 async function setSports() {
   const sports = await parseSports();
+  const schoolYear = schoolYearStart(new Date());
   const batch = db.batch();
-  sports.forEach((sportArr) => {
-    const docRef = db.collection("Sports").doc(sportArr[2]); // Use league_code as document ID.
+  sports.forEach((sport) => {
+    const docRef = db.collection("Sports").doc(sport.leagueCode);
     batch.set(docRef, {
-      name: sportArr[0],
-      term: sportArr[1],
-      league_code: sportArr[2],
-      uses_gamesheet: sportArr[3],
-    });
+      name: sport.name,
+      term: sport.term,
+      league_code: sport.leagueCode,
+      school_year: schoolYear,
+    }, {merge: true});
   });
   await batch.commit();
+  return sports;
+}
+
+/**
+ * Writes a league's standings into its "Sports" document and its Appleby games into "Games".
+ * Standings are left untouched when the page has none, so a bad fetch does not blank the table.
+ * @param {{name: string, term: string, leagueCode: string}} sport - The league.
+ * @param {{standings: Array<object>, games: Array<object>}} page - The parsed results page.
+ * @return {Promise<number>} The number of games written.
+ * @async
+ */
+async function writeLeague(sport, page) {
+  const standings = toStandings(page, sport.leagueCode).map((s) => s.toMap());
+  const games = toGames(page, sport);
+  const batch = db.batch();
+
+  if (standings.length > 0) {
+    // Assumes the Sport document itself is created by setSports first.
+    batch.update(db.collection("Sports").doc(sport.leagueCode), {standings_data: standings});
+  } else {
+    console.warn(`No standings found for ${sport.name} (${sport.leagueCode}); keeping the stored standings.`);
+  }
+  games.forEach((game) => {
+    batch.set(db.collection("Games").doc(game.game_code), game, {merge: true});
+  });
+
+  await batch.commit();
+  console.log(`${sport.name} (${sport.leagueCode}): ${standings.length} standings rows, ${games.length} games`);
+  return games.length;
+}
+
+/**
+ * Scrapes and writes every given league, then fails the run if no games were found at all.
+ * @param {Array<{name: string, term: string, leagueCode: string}>} sports - The leagues.
+ * @return {Promise<number>} The total number of games written.
+ * @throws {Error} If no league produced any games.
+ * @async
+ */
+async function writeLeagues(sports) {
+  const counts = await mapLimit(sports, FETCH_CONCURRENCY, async (sport) => writeLeague(sport, await scrapeLeague(sport.leagueCode)));
+  const total = counts.reduce((sum, count) => sum + count, 0);
+  if (total === 0) {
+    throw new Error(`Scraped ${sports.length} leagues but found no Appleby games; the CISAA results page layout may have changed.`);
+  }
+  return total;
+}
+
+/**
+ * Reads one "Sports" document.
+ * @param {string} leagueCode - The league code (document ID).
+ * @return {Promise<{name: string, term: string, leagueCode: string}>} The league.
+ * @throws {Error} If no such document exists.
+ * @async
+ */
+async function getSport(leagueCode) {
+  const docSnap = await db.collection("Sports").doc(leagueCode).get();
+  if (!docSnap.exists) {
+    throw new Error(`Sport document ${leagueCode} not found; run setSports first.`);
+  }
+  return toLeague(docSnap.data());
 }
 
 /**
  * setStandings:
- * Scrapes standings data and writes it as an array field in the "Sports" document.
+ * Scrapes a league's standings and writes them as the standings_data array of its "Sports" document.
  * @param {string} leagueCode - The league code for which to set standings.
- * @param {boolean} usesGamesheet - Indicates if the league uses GameSheet.
- * @param {object} browser - An optional Puppeteer browser instance.
+ * @throws {Error} If the page has no standings or the Sport document does not exist.
+ * @async
  */
-async function setStandings(leagueCode, usesGamesheet, browser) {
-  const standingInstances = await parseStandings(leagueCode, usesGamesheet, browser);
-  const standingsDataArray = standingInstances.map((s) =>
-    s.toMap ? s.toMap() : Object.assign({}, s),
-  );
-
-  const sportDocRef = db.collection("Sports").doc(leagueCode);
-  try {
-    // This will add/overwrite the standings_data field.
-    // It assumes the Sport document itself is created by setSports first.
-    await sportDocRef.update({
-      standings_data: standingsDataArray,
-    });
-    console.log(`Standings array updated for sport ${leagueCode}`);
-  } catch (error) {
-    console.error(`Error updating sport ${leagueCode} with standings array. Ensure sport document exists.`, error);
-    // Re-throw the error if you want the caller to handle it
-    throw error;
+async function setStandings(leagueCode) {
+  const page = await scrapeLeague(leagueCode);
+  const standingsDataArray = toStandings(page, leagueCode).map((s) => s.toMap());
+  if (standingsDataArray.length === 0) {
+    throw new Error(`No standings found for league ${leagueCode}.`);
   }
+  await db.collection("Sports").doc(leagueCode).update({standings_data: standingsDataArray});
+  console.log(`Standings array updated for sport ${leagueCode}`);
 }
 
 /**
  * setGames:
- * Scrapes game data and writes/updates each document in the "Games" collection.
- * Goals are stored as an array of maps directly within the game document for Gamesheet games.
+ * Scrapes Appleby's games in a league and writes/updates each document in the "Games" collection.
  * @param {string} leagueCode - The league code for which to set games.
- * @param {boolean} usesGamesheet - Indicates if the league uses GameSheet.
- * @param {object} browser - An optional Puppeteer browser instance.
- * @throws {Error} If an error occurs during the process.
+ * @throws {Error} If the Sport document does not exist or committing fails.
+ * @async
  */
-async function setGames(leagueCode, usesGamesheet, browser) {
-  try {
-    const applebyTeamCode = usesGamesheet ? await getApplebyTeamCode(leagueCode) : null;
-    const games = await parseGames(leagueCode, usesGamesheet, browser, applebyTeamCode); // Pass applebyTeamCode
-    const batch = db.batch();
-
-    games.forEach((game) => {
-      // Convert game instance to a plain object.
-      // For GamesheetGame instances, game.toMap() will include a 'goals' field
-      // which is an array of goal maps, as per GamesheetGame.toMap().
-      const gameData = typeof game.toMap === "function" ? game.toMap() : {...game};
-
-      // The subcollection logic for goals is removed.
-      // gameData now directly contains the 'goals' array if it's a Gamesheet game and has goals.
-      // If it's a non-Gamesheet game or has no goals, the 'goals' field might be absent or empty,
-      // which is handled by game.toMap() and GamesheetGame.toMap().
-
-      // Create a reference for the game document.
-      const gameDocRef = db.collection("Games").doc(gameData.game_code);
-      batch.set(gameDocRef, gameData, {merge: true}); // gameData is set with goals included as an array field
-    });
-    await batch.commit();
-  } catch (error) {
-    console.error("Error in setGames:", error);
-    throw error; // Propagate error to be caught in testGamesUpload
-  }
-}
-
-/**
- * setRoster:
- * Scrapes roster data and writes/updates each document in the "Roster" collection.
- * Player data is stored as an array of maps in the team roster document.
- * The team roster document ID is a sanitized version of the sport name.
- * @param {string} leagueCode - The league code for which to set the roster.
- * @param {boolean} usesGamesheet - Indicates if the league uses GameSheet.
- * @param {object} browser - An optional Puppeteer browser instance.
- * @throws {Error} If an error occurs during the process.
- */
-async function setRoster(leagueCode, usesGamesheet, browser) {
-  // Ensure Firebase is initialized
-  if (!firebaseInitialized) {
-    initializeFirebase();
-  }
-  if (!db) {
-    console.error("Firestore database (db) is not initialized in setRoster.");
-    throw new Error("Firestore database (db) is not initialized.");
-  }
-
-  // If the league does not use Gamesheet, rosters are not applicable.
-  if (!usesGamesheet) {
-    console.log(`Rosters are only applicable for Gamesheet leagues. Skipping for non-Gamesheet league ${leagueCode}.`);
-    return;
-  }
-
-  try {
-    const applebyTeamCode = await getApplebyTeamCode(leagueCode); // applebyTeamCode will be null if not found, which is handled by parseRoster
-    const rosterArr = await parseRoster(leagueCode, usesGamesheet, browser, applebyTeamCode); // Pass applebyTeamCode
-    if (!rosterArr || rosterArr.length === 0) {
-      console.log(`No roster data found for league ${leagueCode}. Skipping Firestore update.`);
-      return;
-    }
-
-    // Determine the team name (primarily for logging and as an attribute)
-    let originalTeamName = "Appleby College"; // Default
-    if (rosterArr[0] && rosterArr[0].teamName && String(rosterArr[0].teamName).trim() !== "") {
-      originalTeamName = String(rosterArr[0].teamName).trim();
-    } else {
-      console.warn(`Team name not found on first roster item for league ${leagueCode}. 
-      Defaulting to '${originalTeamName}'. This will be stored as an attribute.`);
-    }
-
-    // Get sport information
-    const sportInfo = Sports.getSportByLeagueCode(leagueCode);
-    if (!sportInfo || !sportInfo[0]) {
-      console.error(`Critical: Sport name could not be determined for league ${leagueCode}. Aborting roster set.`);
-      return;
-    }
-    const sportName = String(sportInfo[0]).trim();
-    if (!sportName) {
-      console.error(`Critical: Sport name is empty for league ${leagueCode}. Aborting roster set.`);
-      return;
-    }
-
-    // Sanitize sportName for Firestore document ID
-    const sportDocId = sportName.replace(/[.#$[\]/]/g, "_").replace(/\s+/g, "_");
-    if (!sportDocId) {
-      console.error(`Critical: Sport Document ID became empty after sanitizing sportName '${sportName}' for league ${leagueCode}. Aborting roster set.`);
-      return;
-    }
-
-    const sportDocRef = db.collection("Team Rosters").doc(sportDocId);
-
-    const playersDataArray = [];
-    console.log("About to process these players for array storage:", rosterArr.map((p) => p.playerName || p.name));
-
-    // Loop through players and prepare their data for the array
-    for (const playerObj of rosterArr) {
-      const nameToTest = playerObj.playerName || playerObj.name;
-
-      if (!nameToTest || String(nameToTest).trim() === "") {
-        console.warn("Player name is missing or empty. Skipping player:", playerObj);
-        continue;
-      }
-
-      const playerData = typeof playerObj.toMap === "function" ? playerObj.toMap() : {...playerObj};
-      playerData.playerName = String(nameToTest).trim();
-
-      if (playerData.name && playerData.name !== playerData.playerName) {
-        delete playerData.name;
-      } else if (playerData.name && playerData.name === playerData.playerName) {
-        delete playerData.name;
-      }
-
-      if ("teamName" in playerData) {
-        delete playerData.teamName;
-      }
-      playersDataArray.push(playerData);
-    }
-
-    // Prepare sport/team document attributes, now including the players_data array
-    const sportTeamAttributes = {
-      sportName: sportName, // The actual sport name
-      teamName: originalTeamName, // The specific team name, e.g., "Appleby College"
-      leagueCode: leagueCode,
-      usesGamesheet: usesGamesheet,
-      season: sportInfo[1] || null, // Fall, Winter, Spring
-      lastUpdated: new Date(),
-      players_data: playersDataArray, // Store players as an array of maps
-    };
-
-    // Set the document with the roster array
-    await sportDocRef.set(sportTeamAttributes, {merge: true});
-
-    console.log(`Roster for sport '${sportName}' (team '${originalTeamName}', league ${leagueCode})
-     and its players successfully set/updated in Firestore as an array.`);
-  } catch (error) {
-    console.error(`Error in setRoster for league ${leagueCode}: ${error.message}`, error.stack);
-    throw error;
-  }
+async function setGames(leagueCode) {
+  const sport = await getSport(leagueCode);
+  const games = toGames(await scrapeLeague(leagueCode), sport);
+  const batch = db.batch();
+  games.forEach((game) => {
+    batch.set(db.collection("Games").doc(game.game_code), game, {merge: true});
+  });
+  await batch.commit();
+  console.log(`${games.length} games written for sport ${leagueCode}`);
 }
 
 /**
  * setAll:
- * Sets all sports, standings, and games data.
- * It first sets all sports, then retrieves them, and for each sport,
- * it sets the corresponding standings, games, and rosters using a shared Puppeteer browser instance if needed.
+ * Finds this year's Appleby leagues, then writes standings and games for each of them.
+ * @throws {Error} If no leagues or no games are found.
+ * @async
  */
 async function setAll() {
-  await setSports();
-  const sports = await getSports();
-
-  // Check if any sport uses GameSheet to determine if a browser is needed
-  const needsBrowser = sports.some((sport) => sport.uses_gamesheet);
-  let browser = null;
-
-  try {
-    if (needsBrowser) {
-      browser = await puppeteer.launch({
-        headless: true,
-        timeout: 0,
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
-      });
-    }
-
-    const promises = sports.map(async (sport) => {
-      // Pass the single browser instance if the sport uses Gamesheet
-      const browserToUse = sport.uses_gamesheet ? browser : null;
-      await setStandings(sport.league_code, sport.uses_gamesheet, browserToUse);
-      await setGames(sport.league_code, sport.uses_gamesheet, browserToUse);
-      await setRoster(sport.league_code, sport.uses_gamesheet, browserToUse);
-    });
-    await Promise.all(promises);
-    console.log("All sports, standings, games, and rosters set successfully using a shared browser instance where applicable.");
-  } catch (error) {
-    console.error("Error in setAll with shared browser instance:", error);
-    // Optionally re-throw or handle as needed
-    throw error;
-  } finally {
-    if (browser) {
-      await browser.close();
-      console.log("Shared browser instance closed in setAll.");
-    }
-  }
+  const sports = await setSports();
+  const total = await writeLeagues(sports);
+  console.log(`All sports, standings and games set: ${sports.length} leagues, ${total} games.`);
 }
 
 /**
@@ -335,12 +231,12 @@ async function getAllStandings() {
 }
 
 /**
- * Retrieves games for a specific league (sport ID) from the "Games" collection in Firestore.
- * @param {string} leagueNum - The league code (sport_id) for which to retrieve games.
+ * Retrieves games for a specific league from the "Games" collection in Firestore.
+ * @param {string} leagueNum - The league code for which to retrieve games.
  * @return {Promise<Array<object>>} A promise that resolves to an array of game objects.
  */
 async function getGames(leagueNum) {
-  const snapshot = await db.collection("Games").where("sport_id", "==", leagueNum).get();
+  const snapshot = await db.collection("Games").where("league_code", "==", leagueNum).get();
   const games = [];
   snapshot.forEach((doc) => games.push(doc.data()));
   return games;
@@ -358,43 +254,13 @@ async function getAllGames() {
 }
 
 /**
- * Retrieves the GameSheet team ID for Appleby College for a specific league.
- * It queries the standings array in the Sport document for a team named "Appleby College".
- * @param {string} leagueNum - The league code for which to find the Appleby team code.
- * @return {Promise<string|null>} A promise that resolves to the GameSheet team ID or null if not found or an error occurs.
- */
-async function getApplebyTeamCode(leagueNum) {
-  try {
-    const sportDocRef = db.collection("Sports").doc(leagueNum);
-    const docSnap = await sportDocRef.get();
-
-    if (docSnap.exists) {
-      const sportData = docSnap.data();
-      const standingsArray = sportData.standings_data;
-
-      if (Array.isArray(standingsArray)) {
-        const applebyStanding = standingsArray.find((s) => s.teamName === "Appleby College");
-        return applebyStanding && applebyStanding.gamesheetTeamId ? applebyStanding.gamesheetTeamId : null;
-      }
-    }
-    console.log(`Sport document ${leagueNum} or its standings_data not found for getApplebyTeamCode.`);
-    return null;
-  } catch (error) {
-    console.error(`Error getting Appleby team code for league ${leagueNum}:`, error);
-    return null;
-  }
-}
-
-/**
- * Retrieves the roster for a specific league (sport) from the "Team Rosters" collection.
- * The roster (players) is stored as an array of maps in the team roster document.
+ * Retrieves a stored roster from the "Team Rosters" collection. Rosters came from GameSheet, which CISAA
+ * no longer uses, so these documents are no longer updated.
  * @param {string} leagueNum - The document ID of the sport in "Team Rosters" (typically the sanitized sport name).
  * @return {Promise<Array<object>>} A promise that resolves to an array of player objects, or an empty array if an error occurs or no roster is found.
  */
 async function getRoster(leagueNum) {
   try {
-    // The document ID for "Team Rosters" is typically the sanitized sport name.
-    // This part depends on how leagueNum is being passed. If leagueNum is the sanitized sport name:
     const sportDocRef = db.collection("Team Rosters").doc(leagueNum);
     const docSnap = await sportDocRef.get();
 
@@ -590,83 +456,23 @@ async function getAllEvents() {
 
 /**
  * updateGamesStandings:
- * Uses getSports() to retrieve sports from Firestore, then updates games and standings for each sport,
- * filtered by the current season. Manages a single Puppeteer browser instance for GameSheet sports.
+ * Updates games and standings for this school year's sports in the current season.
+ * @throws {Error} If no sports are stored for this school year or no games are found.
+ * @async
  */
 async function updateGamesStandings() {
   console.log("Updating games and standings in Firestore");
-  const sports = await getSports();
   const today = new Date();
+  const schoolYear = schoolYearStart(today);
+  const sports = (await getSports()).filter((sport) => sport.school_year === schoolYear);
+  if (sports.length === 0) {
+    throw new Error(`No Sports documents for the ${schoolYear} school year; run setSports or setAll first.`);
+  }
   const season = getSeason(today);
   const filteredSports = season !== "Unknown" ? sports.filter((sport) => sport.term === season) : sports;
 
-  // 2. Check if any sport uses GameSheet
-  const hasGameSheetSport = filteredSports.some((sport) => sport.usesGamesheet);
-
-  let browser;
-
-  try {
-    // 3. Launch ONE browser if needed
-    if (hasGameSheetSport) {
-      browser = await puppeteer.launch({
-        headless: true,
-        timeout: 0,
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
-      });
-    }
-
-    // 4. For each sport, set games and standings using the same browser
-    const promises = filteredSports.map(async (sport) => {
-      await setGames(sport.league_code, sport.uses_gamesheet, browser); // Pass sport.uses_gamesheet
-      await setStandings(sport.league_code, sport.usesGamesheet, browser);
-    });
-
-    await Promise.all(promises);
-
-    console.log("Games and standings updated in Firestore");
-  } catch (err) {
-    console.error("Error in updateGamesStandings:", err);
-  } finally {
-    // 5. Close the browser once all sports are processed
-    if (browser) {
-      await browser.close();
-    }
-  }
-}
-
-/**
- * Determines the current sports season based on the given date.
- * @param {Date} date - The date to determine the season for.
- * @return {string} The current season ("Fall", "Winter", "Spring", or "Unknown").
- */
-function getSeason(date) {
-  const month = date.getMonth();
-  const day = date.getDate();
-  let season;
-  switch (month) {
-    case 8:
-    case 9:
-      season = "Fall";
-      break;
-    case 10:
-      season = day >= 10 ? "Winter" : "Fall";
-      break;
-    case 11:
-    case 0:
-    case 1:
-      season = "Winter";
-      break;
-    case 2:
-      season = day >= 10 ? "Spring" : "Winter";
-      break;
-    case 3:
-    case 4:
-      season = "Spring";
-      break;
-    default:
-      season = "Unknown";
-  }
-  return season;
+  const total = await writeLeagues(filteredSports.map(toLeague));
+  console.log(`Games and standings updated in Firestore: ${filteredSports.length} leagues, ${total} games`);
 }
 
 module.exports = {
@@ -675,14 +481,12 @@ module.exports = {
   setSports,
   setStandings,
   setGames,
-  setRoster,
   setAll,
   getSports,
   getStandings,
   getAllStandings,
   getGames,
   getAllGames,
-  getApplebyTeamCode,
   getRoster,
   setLunchMenu,
   getLunchMenuByDate,
